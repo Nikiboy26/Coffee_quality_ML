@@ -1,0 +1,279 @@
+---
+title: "Coffee"
+author: "Nikita Kaymonov"
+date: "6/25/2021"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Coffee quality prediction 
+
+#### Introduction
+
+Hi, I'm Nikita. I love high quality coffee. You probably have seen a lot of specialty cafes lately. For coffee to be put in "specialty" category it has to graded higher than 80 points on 100 point scale. People who taste and grade coffee are trained specialists (like wine sommelier) called q-graders. They can evaluate the quality and defects of green beans, find potential mistakes in coffee roasting and identify different roasts. I don't have highly developed sensory skills needed to be a graders. But I have other skills. So here I want to use machine learning to predict coffee quality using different data on coffee beans. 
+
+Sounds interesting to you? Check out this analysis! 
+
+Let's start with loading necessary packages we need for this project
+
+```{r echo = T, message=FALSE}
+library(tidyverse)
+library(readr)
+library(caret)
+library(mlbench)
+library(ranger)
+library(assertive)
+
+```
+
+### Doownload dataset 
+
+Now let's download our coffee data. You can find it [here](https://raw.githubusercontent.com/Nikiboy26/Coffee_quality_ML/main/Coffee%20Dataset.csv)
+
+```{r echo = T, message=FALSE}
+coffee <- read_csv("https://raw.githubusercontent.com/Nikiboy26/Coffee_quality_ML/main/Coffee%20Dataset.csv") %>%
+  rename_all(tolower) #I like when there's consistency with names, makes analysis easier
+
+#Rename first column
+coffee<-coffee%>%
+  rename("id" = "x1")
+```
+
+Take a look at column names for the dataset
+```{r}
+colnames(coffee)
+```
+
+#### Select needed columns
+We don't need all the data. So let's pick only needed columns 
+```{r }
+coffee_sub <- coffee%>%
+  select(id, owner, country.of.origin, farm.name, mill, company, region, harvest.year, 
+         producer, variety, processing.method, category.one.defects, 
+         quakers, category.two.defects, altitude_mean_meters, total.cup.points)
+```
+
+#### Country of origin 
+
+We have a lot of countries, let's see what are the most popular countries of origin
+
+```{r}
+head(coffee_sub%>%
+  count(country.of.origin)%>%
+  arrange(desc(n)), 10)%>%
+  ggplot(aes(x = reorder(country.of.origin,-n), y = n)) + geom_bar(stat = "identity") + labs(x = "Country", y = "Coffee")
+```
+
+And rare countries 
+```{r}
+head(coffee_sub%>%
+       count(country.of.origin)%>%
+       arrange(n), 10)%>%
+  ggplot(aes(x = reorder(country.of.origin,-n), y = n)) + geom_bar(stat = "identity") + labs(x = "Country", y = "Coffee")
+```
+
+We have 14 countries with less than 6 bags of coffee, there's not a whole lot of sense to add these rare countries for modeling, let's use countries with at least 6 bags.  
+
+```{r}
+countries <- head(coffee_sub%>% 
+  count(country.of.origin)%>%
+  arrange(n), 14) #Create a vector with 14 rarest countries in dataset
+
+coffee_sub <- coffee_sub%>%
+  filter(!country.of.origin %in% c(countries$country.of.origin)) #Remove these countries
+
+#See countries with lowest amount of coffee now 
+head(coffee_sub%>%
+       count(country.of.origin)%>%
+       arrange(n), 10)%>%
+  ggplot(aes(x = reorder(country.of.origin,-n), y = n)) + geom_bar(stat = "identity") + labs(x = "Country", y = "Coffee")
+```
+
+
+#### Distinct values in dataset 
+Let's see a number of distinct values for each column
+```{r }
+coffee_sub%>% 
+  summarise_all(n_distinct)
+```
+
+#### Remove columns 
+Columns like: owner, farm.name, mill, region, producer, company have a lot of distinct values. It is not a very good idea to use these variables for prediction models, so we remove them. 
+
+```{r }
+coffee_sub <- coffee_sub%>%
+  select(-c(owner, farm.name, mill, region, producer, company))
+```
+
+### Cleaning 
+#### Year
+
+Let's see what we have in "year" column
+
+```{r }
+unique(coffee_sub$harvest.year) #Get unique year values
+```
+
+This is not the best way . But almost all columns exept "08/09 crop" and "4T/10" contain 4 digits year information, so we'll need only few lines of code to handle this problem. 
+
+In dates like "2014/2015" format I decided to use the first year.
+
+```{r }
+coffee_sub$harvest.year <- str_replace_all(coffee_sub$harvest.year, "08/09 crop", "2008")
+coffee_sub$harvest.year <- str_replace_all(coffee_sub$harvest.year, "4T/10", "2010")
+
+#Get first year in two years formar
+coffee_sub$harvest.year <- as.numeric(str_extract(coffee_sub$harvest.year, pattern = "20[0-1][0-9]"))
+```
+
+Now let's see year column after formatting 
+```{r }
+coffee_sub%>%
+  count(harvest.year)
+```
+
+Looks good, except we have number of NA's, so let's check if it's at random 
+
+```{r}
+coffee_sub %>% 
+  filter(is.na(harvest.year))%>%
+  count(altitude_mean_meters, processing.method)%>%
+  arrange(n)
+```
+
+Almost all coffee that misses year also misses processing method information and info about altitude. So we can just drop those rows. 
+```{r}
+coffee_sub <- coffee_sub%>% na.omit()
+
+length(which(is.na(coffee_sub))) #Make sure no NA's
+```
+Now that we don't have NA's in dataset, we can check for out of range values 
+
+#### Out of range values 
+##### Altitude
+
+We have coffee grown at different altitude, let's see distribution 
+
+```{r}
+ggplot(coffee_sub, aes(x = altitude_mean_meters, y =  total.cup.points, color = processing.method)) + 
+  geom_point()
+```
+
+Clearly we have three outliers, let's take a closer look 
+```{r}
+coffee%>%
+  filter(altitude_mean_meters > 5000)%>%
+  select(country.of.origin, harvest.year, altitude_mean_meters, altitude, region)
+```
+
+Looks like there was a mistake while reporting data for Guatemala coffee and somebody missed a decimal. The same with Nicaragua coffee. 
+
+```{r}
+coffee_sub$altitude_mean_meters <- str_replace_all(coffee_sub$altitude_mean_meters, "110000", "1100")
+coffee_sub$altitude_mean_meters <- str_replace_all(coffee_sub$altitude_mean_meters, "11000", "1100")
+coffee_sub$altitude_mean_meters <- str_replace_all(coffee_sub$altitude_mean_meters, "190164", "1901")
+```
+
+Let's make sure everything is within a range. 
+
+```{r}
+assert_all_are_in_closed_range(coffee_sub$altitude_mean_meters, lower = 0, upper = 5000)
+```
+
+Looking good. Finally we can get to predictions. 
+
+### Building predictive models
+
+#### Test/train split 
+
+Let's start with splitting data into test and train sets, so we don't predict on the same data we used for training and our model is actually good for predicting. 
+
+```{r}
+coffee_sub <- coffee_sub%>%
+  select(-id)
+
+set.seed(150)
+rows <- sample(nrow(coffee_sub))
+
+# Randomly order data
+shuffled_coffee <- coffee_sub[rows,]
+
+# Determine row to split on: split
+split <- round(nrow(coffee_sub) * .80)
+
+# Create train
+train <- shuffled_coffee[1:split,]
+
+# Create test
+test <- shuffled_coffee[(split +1):nrow(shuffled_coffee),]
+```
+
+#### Cross validation model 
+
+Let's try lm model with cross validation. It's a good start. 
+
+```{r echo = T, message=FALSE, results='hide', warning=FALSE}
+set.seed(66)
+# Fit lm model using 10-fold CV: model
+model_cv <- train(
+  total.cup.points ~., 
+  coffee_sub,
+  method = "lm",
+  trControl = trainControl(
+    method = "cv", 
+    number = 10,
+    verboseIter = TRUE
+  )
+)
+
+p <- predict(model_cv, test)
+```
+
+To evaluate a regression model I like to use RMSE(root mean square error). The smaller here is better. 
+
+```{r}
+error <- p - test[,"total.cup.points"]
+
+rmse_cv <-  sqrt(mean(error$total.cup.points^2)) #SD = 1.722239
+rmse_cv
+```
+
+Good start, but we want RMSE that less than standart deviation in dataset, so let's try Random Forest 
+
+#### Random forest 
+
+```{r echo = T, message=FALSE, results='hide', warning=FALSE}
+set.seed(60)
+model_rf <- train(
+  total.cup.points ~.,
+  tuneLength = 1,
+  data = coffee_sub, 
+  method = "ranger",
+  trControl = trainControl(
+    method = "cv", 
+    number = 5, 
+    verboseIter = TRUE
+  )
+)
+
+p <- predict(model_rf, test)
+```
+
+And calculate RMSE
+
+```{r}
+error <- p - test[,"total.cup.points"]
+
+# Calculate RMSE
+rmse_rf <-  sqrt(mean(error$total.cup.points^2)) # 
+rmse_rf
+```
+
+So we got RMSE 1.25153 which is pretty good result given SD = 2.610294. Since hiring q-graders can be expensive, some coffee farmers can actually use machine learning for grading their coffee. 
+
+##### Conclusion 
+This is my quick take on this dataset, maybe you can come up with different ideas and questions for analysis. 
