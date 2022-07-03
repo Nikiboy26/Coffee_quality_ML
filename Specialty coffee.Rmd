@@ -1,0 +1,313 @@
+---
+title: "Coffee"
+author: "Nikita Kaymonov"
+date: "6/25/2021"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r include=FALSE}
+library(tidyverse)
+library(caret)
+library(mlbench)
+library(ranger)
+library(assertive)
+library(visdat)
+library(plotly)
+library(crosstalk)
+library(data.table)
+
+```
+
+All the code and data is [here](https://github.com/Nikiboy26/Coffee_quality_ML)
+
+#### Project brief  
+
+You are working for the company that buys coffee from the farmers and sells it to cafes. Every time they get beans they have to pay q-graders to grade the coffee so they can set better prices. 
+
+Your manager has asked to develop the model that would predict the grade points without the need to hire graders.Also any other insights from the data you can find. 
+
+
+```{r include=FALSE}
+### IMPORTING DATA AND CLEANING IT 
+coffee <- read_csv("https://raw.githubusercontent.com/Nikiboy26/Coffee_quality_ML/main/Coffee%20Dataset.csv") %>%
+  rename_all(tolower) #I like when there's consistency with names, makes analysis easier
+#Rename first column
+coffee<-coffee%>%
+  rename("id" = "...1")
+
+coffee <- coffee%>%
+  select(id, country.of.origin, region, harvest.year, 
+        variety, processing.method, category.one.defects, 
+         quakers, category.two.defects, altitude_mean_meters, total.cup.points)
+coffee["country.of.origin"][coffee["country.of.origin"] == "Tanzania, United Republic Of"] <- "Tanzania"
+coffee["country.of.origin"][coffee["country.of.origin"] == "United States (Hawaii)"] <- "Hawaii"
+
+coffee$harvest.year <- str_replace_all(coffee$harvest.year, "08/09 crop", "2008") #Clean weird date formats 
+coffee$harvest.year <- str_replace_all(coffee$harvest.year, "4T/10", "2010")
+#Get first year in two years format
+coffee$harvest.year <- as.numeric(str_extract(coffee$harvest.year, pattern = "20[0-1][0-9]"))
+
+
+#Remove countries with less than 10 bags for later modeling 
+coffee <- coffee%>%
+  filter(country.of.origin %in% c(coffee%>%
+                                    count(country.of.origin)%>%
+                                    filter(n > 10)%>%
+                                    pull(country.of.origin)))
+
+#Clean process methods 
+coffee <- coffee%>%
+  filter(!is.na(processing.method))%>%
+  mutate(processing.method = str_extract(processing.method, pattern = "\\w+\\s"),
+         processing.method = str_replace_all(processing.method, " ", ""),
+         processing.method = str_replace_all(processing.method, "washed", "Semi-washed"))
+
+coffee$processing.method[is.na(coffee$processing.method)] <- 'Other'
+
+#Looks like there was a mistake while reporting data for Guatemala coffee and somebody missed a decimal. The same with Nicaragua coffee. 
+coffee <- coffee %>%
+  mutate(altitude_mean_meters = str_replace_all(altitude_mean_meters, c('110000' = "1100", 
+                                                                  '11000' = "1100",
+                                                                  '190164' = '1901')))%>%
+  filter(!is.na(altitude_mean_meters))%>%
+  mutate(altitude = as.numeric(altitude_mean_meters))%>%
+  filter(altitude > 100) #Not sure if 1 meter is a legit altitude looks like data-entry error 
+
+#Create grade category column, total bags in category and % out of the category
+coffee <- coffee%>%
+  mutate(grade = case_when(
+    total.cup.points >= 85 ~ 'Excellent',
+    total.cup.points >= 80 ~ 'Very Good',
+    total.cup.points < 80 ~ 'Not Specialty'
+  ))%>%
+  group_by(grade)%>%
+  mutate(total_bags = n(),
+         percent = signif(total_bags/935,2)*100)%>%
+  ungroup()
+
+
+
+```
+
+
+
+### Country of origin 
+
+```{r}
+#Process Methods
+
+methods <- c("Other", "Pulped", 'Semi-washed')
+
+countries.and.methods <- coffee%>%
+  #Collapse of semi-washed methods to one category
+  mutate(processing.method = fct_collapse(processing.method, 
+                                          'Semi-washed' = methods))%>%
+  count(country.of.origin, processing.method)
+
+setDT(countries.and.methods)
+countries.and.methods[, total_bags := sum(n), by = country.of.origin]
+# setDF(df)
+
+#Bar plot 
+countries.and.methods%>%
+  plot_ly(x = ~reorder(country.of.origin, n), y = ~n, color = ~processing.method,
+          type = 'bar',
+          colors = c('#003f5c', '#bc5090', '#ffa600'),
+          width = 800, height = 600,
+          hoverinfo = 'text',
+          hovertext = ~paste("<b>Country:</b>", country.of.origin, "<br><b>Bags:</b>",
+                             n, "<br><b>Processed:</b>",
+                             processing.method, "<br><b>Total bags:</b>", total_bags))%>%
+  layout(barmode = 'stack', 
+         xaxis = list(categoryorder = "total ascending",
+                      title = 'Country'),
+         yaxis = list(title = 'Number of Bags'), 
+         title = ' countries and processing methods')
+
+```
+
+The majority of coffee beans come from the Americas and are mostly processed using a washed method. 
+
+Natural (dry) method is often used in regions with limited access to water and Brazil is one of these regions. However this method has some advantages in terms of taste. Dried coffee tends to have a rich and heavy body, which many coffee drinkers prefer. Also it allows us to experiment with different fermentation techniques. 
+
+### Processing methods 
+```{r}
+coffee%>%
+  count(processing.method)%>%
+  plot_ly(x = ~processing.method, y = ~n,
+          type = 'bar', color = I('#003f5c'))%>%
+  layout(xaxis = list(title = 'Processing methods'),
+         yaxis = list(title = 'Number of Bags'))
+
+
+```
+
+As I mentioned above the majority of bages processed using a washed method followed by a natural method. Other bags fall to the semi-washed category and its different variations (like pulped, honey etc).
+
+### Qality and Altitude
+```{r}
+shared_coffee <- coffee%>%
+  SharedData$new()
+
+p17 <- shared_coffee%>%
+  plot_ly(x = ~total.cup.points, y = ~altitude, color = ~processing.method,
+          colors = c('#7a5195','#003f5c', '#bc5090', '#58508d', '#ffa600'),
+           opacity = 0.5, hoverinfo = 'text',
+          text = ~paste(
+            'Grade:', total.cup.points, '<br>',
+            'Altitude:', altitude, '<br>',
+            'Country:', country.of.origin, sep = ''
+          ))%>%
+  add_markers()%>%
+  layout(xaxis = list(range = c(60, 100), title = "Grade points"),
+         yaxis = list(range = c(0, 5000), title = 'Altitude'),
+         showlegend = FALSE)
+ 
+# add a slider filter for each axis below the scatterplot
+bscols(widths = c(2,NA),
+       list(filter_select("method", 'Processing Method', shared_coffee, ~processing.method),
+            filter_select('country', 'Origin',shared_coffee, ~country.of.origin),
+            filter_slider("year", "Year", shared_coffee, ~harvest.year, width = "100%")),
+p17
+  )
+```
+
+It’s a commonly-held belief that the higher the altitude, the better the quality. There is some truth to that and low altitude coffees tend to taste earthy and dull and are best avoided.<br>
+However we don’t see a strong correlation which means there are many other factors that affect the taste. Saying that, all the bags with 85 or higher grade points grow at 1000 metres and higher. 
+
+### Grade categories 
+```{r}
+coffee%>%
+  distinct(grade, total_bags, percent, .keep_all = TRUE)%>%
+  select(c(grade, total_bags, percent))%>%
+  mutate(grade = factor(grade, levels =c('Not Specialty', 'Very Good', 'Excellent')))%>%
+  plot_ly(x = ~grade, y = ~total_bags, type = 'bar', color = I('#003f5c'),
+          hoverinfo = 'text',
+          hovertext = ~paste("<b>Bags:</b>", total_bags, "<br><b>% out of all:</b>",
+                             percent))%>%
+  layout(xaxis = list(title = 'Grade'),
+         yaxis = list(title = 'Number of Bags'))
+```
+
+The highest grading point we have in this dataset is 90.58. Which means we don't really have bags with 'outstanding' coffee. There are some "excellent" (85+)  coffees but most bags fall into the 'Very Good' (80+)  category. Which means only 13.5% of our coffee has a grade below 80 and can not be labelled as 'Specialty Coffee'.
+So if you would randomly pick a bag from our dataset most likely you will enjoy your cup of coffee (assuming you know how to brew it). 
+
+### Grade distribution per country 
+
+```{r}
+shared <- coffee%>%
+  SharedData$new()
+
+
+p <- shared%>%
+  plot_ly(x = ~total.cup.points,
+          y = ~country.of.origin, 
+          color = ~processing.method, 
+          colors = c('#7a5195','#003f5c', '#bc5090', '#58508d', '#ffa600'),
+          width = 800, height = 600
+  )%>%
+  add_markers()%>%
+  layout(xaxis = list(range = c(60, 100), title = "Grade points"),
+         yaxis = list(title = 'Country'))
+
+# add a slider filter for each axis below the scatterplot
+bscols(widths = c(2,NA),
+       filter_select("method", 'Grade', shared, ~grade),
+p
+  )
+
+```
+
+
+## Modelling 
+```{r include= FALSE}
+coffee <- coffee%>% na.omit() #Remove the rest of NA's (0.3%)
+
+coffee <- coffee%>% 
+  select(-c(id,altitude_mean_meters, grade, total_bags, percent)) 
+
+```
+
+```{r}
+
+set.seed(150)
+rows <- sample(nrow(coffee))
+# Randomly order data
+shuffled_coffee <- coffee[rows,]
+# Determine row to split on: split
+split <- round(nrow(coffee) * .80)
+# Create train
+train <- shuffled_coffee[1:split,]
+# Create test
+test <- shuffled_coffee[(split +1):nrow(shuffled_coffee),]
+```
+
+#### Cross validation model 
+Let's try lm model with cross validation. It's a good start. 
+
+```{r echo = T, message=FALSE, results='hide', warning=FALSE}
+set.seed(66)
+# Fit lm model using 10-fold CV: model
+model_cv <- train(
+  total.cup.points ~., 
+  coffee,
+  method = "lm",
+  trControl = trainControl(
+    method = "cv", 
+    number = 10,
+    verboseIter = TRUE
+  )
+)
+p <- predict(model_cv, test)
+```
+
+To evaluate a regression model I like to use RMSE(root mean square error). The smaller here is better. 
+
+```{r}
+error <- p - test[,"total.cup.points"]
+rmse_cv <-  sqrt(mean(error$total.cup.points^2)) #SD = 1.722239
+rmse_cv
+```
+
+Good start, but we want RMSE that less than standart deviation in dataset, so let's try Random Forest 
+
+#### Random forest 
+
+```{r echo = T, message=FALSE, results='hide', warning=FALSE}
+set.seed(60)
+model_rf <- train(
+  total.cup.points ~.,
+  tuneLength = 1,
+  data = coffee, 
+  method = "ranger",
+  trControl = trainControl(
+    method = "cv", 
+    number = 5, 
+    verboseIter = TRUE
+  )
+)
+p <- predict(model_rf, test)
+```
+
+And calculate RMSE
+
+```{r}
+error <- p - test[,"total.cup.points"]
+# Calculate RMSE
+rmse_rf <-  sqrt(mean(error$total.cup.points^2)) # 
+rmse_rf
+```
+
+#### Conclusion
+We got RMSE 1.357035 which is a pretty good result given SD = 2.601557. And we don't know what the human error is , I doubt that q-graders can be more consistent than a ML Model.  <br>
+Since hiring q-graders can be expensive, this model can be used to save money and time for grading the beans. 
+
+
+
